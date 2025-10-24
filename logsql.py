@@ -1,27 +1,12 @@
 #!/usr/bin/env python3
-"""
-SQLite3-like SQL CLI for CSV/text logs
-- 支持 CSV/无表头文本
-- 表名固定为 current
-- 支持标准 SQL: select ... from current where ... group by ... order by ... limit ...
-- 有表头 CSV → 显示真实列名
-- 非 CSV 文件 / 无表头文本 → 显示 $1, $2 …，内部仍用 _N 列名
-- 可通过 --sep 或 .sep 动态设置分隔符（例如 ',', '\t', ' '）
-- 打印漂亮表格，长内容自动换行，去除前后空白
-- 交互式 CLI 类似 SQLite3/MySQL
-Behavior change: Files whose extension is NOT ".csv" are treated as no-header by default.
-"""
-
 import sys
 import os
 import re
 import shutil
 import platform
+import sqlite3
 import pandas as pd
 from tabulate import tabulate
-from pandasql import sqldf
-
-# ------------------------ 工具函数 ------------------------
 
 
 def clear_screen():
@@ -33,7 +18,6 @@ def clean_string_column(col):
 
 
 def wrap_dataframe(df, max_width=None):
-    """自动换行 DataFrame 内容"""
     if max_width is None:
         max_width = shutil.get_terminal_size((80, 20)).columns - 5
     df_wrapped = df.copy()
@@ -50,52 +34,50 @@ def wrap_dataframe(df, max_width=None):
     return df_wrapped
 
 
-def read_log(file_path, has_header=True, sep=None):
-    """读取 CSV 或无表头文本"""
+def read_log(file_path, has_header=True, sep=None, chunksize=None):
     if sep is None:
         sep = r"\s+" if not has_header else ","
     try:
-        if has_header:
-            df = pd.read_csv(
-                file_path, sep=sep, engine="python", quotechar='"', on_bad_lines="skip"
-            )
-            # 如果 pandas 识别到自动生成列名，视为无表头
-            if df.columns.str.contains("Unnamed").any():
-                raise ValueError("No header detected")
-            is_header = True
-        else:
-            df = pd.read_csv(
-                file_path, sep=sep, header=None, engine="python", on_bad_lines="skip"
-            )
-            df = df.copy()
-            df.columns = [f"_{i + 1}" for i in range(len(df.columns))]
-            is_header = False
+        df_iter = pd.read_csv(
+            file_path,
+            sep=sep,
+            engine="python",
+            quotechar='"',
+            on_bad_lines="skip",
+            header=0 if has_header else None,
+            chunksize=chunksize,
+        )
+        return df_iter, has_header
     except Exception:
-        # 任何读取异常都退到无表头解析
-        df = pd.read_csv(
-            file_path, sep=sep, header=None, engine="python", on_bad_lines="skip"
+        df_iter = pd.read_csv(
+            file_path,
+            sep=sep,
+            engine="python",
+            header=None,
+            on_bad_lines="skip",
+            chunksize=chunksize,
         )
-        df = df.copy()
-        df.columns = [f"_{i + 1}" for i in range(len(df.columns))]
-        is_header = False
-
-    df = df.apply(lambda col: clean_string_column(col) if col.dtype == object else col)
-    return df, is_header
+        return df_iter, False
 
 
-def execute_sql(df, query):
-    """执行 SQL 查询"""
+def load_dataframe_to_sqlite(conn, df_iter, table_name="current", is_header=True):
+    cur = conn.cursor()
+    cur.execute(f"DROP TABLE IF EXISTS {table_name}")
+    for chunk in df_iter:
+        # 无表头给列名
+        if not is_header:
+            chunk.columns = [f"_{i + 1}" for i in range(len(chunk.columns))]
+        chunk.to_sql(table_name, conn, if_exists="append", index=False)
+
+
+def execute_sql(conn, query):
     query = query.strip().rstrip(";")
-    # 兼容 $1, $2 写法 → 内部 _N
     query = re.sub(r"\$(\d+)", r"_\1", query)
-
     try:
-        globals()["current"] = df
-        result = sqldf(query, globals())
-        result = result.apply(
-            lambda col: clean_string_column(col) if col.dtype == object else col
-        )
-        return wrap_dataframe(result)
+        df = pd.read_sql_query(query, conn)
+        for col in df.select_dtypes(include="object"):
+            df[col] = clean_string_column(df[col])
+        return wrap_dataframe(df)
     except Exception as e:
         print(f"SQL 执行出错，请检查语法或列名: {e}")
         return None
@@ -106,7 +88,6 @@ def print_result(df, is_header=True):
         print("(0 rows)")
         return
     df_display = df.copy()
-    # 无表头时显示 $N
     if not is_header:
         df_display.columns = [
             f"${int(c[1:])}" if c.startswith("_") and c[1:].isdigit() else c
@@ -114,9 +95,6 @@ def print_result(df, is_header=True):
         ]
     print(tabulate(df_display, headers="keys", tablefmt="grid", showindex=False))
     print(f"({len(df_display)} row{'s' if len(df_display) != 1 else ''})")
-
-
-# ------------------------ CLI ------------------------
 
 
 def print_help():
@@ -130,66 +108,62 @@ def print_help():
     print("  .cols           Show columns")
     print("  .head [N]       Show first N rows")
     print("  .tail [N]       Show last N rows")
-    print("  .sep <char>     Change separator (e.g. .sep ,  or  .sep \\t or .sep \\s+)")
+    print("  .sep <char>     Change separator")
     print("  .clear          Clear screen")
-    print("  .help           Show this help message")
+    print("  .help           Show help")
     print("  .q              Quit")
 
 
-def handle_command(line, df, state):
+def handle_command(line, state):
     cmd = line[1:].strip()
     cmd_lower = cmd.lower()
+    conn = state["conn"]
     if cmd_lower in ("q", "quit"):
         print("Exit.")
         sys.exit(0)
     elif cmd_lower == "help":
         print_help()
     elif cmd_lower.startswith("cols"):
-        if state["is_header"]:
-            cols_display = df.columns.tolist()
-        else:
-            cols_display = [f"${int(c[1:])}" for c in df.columns]
-        print("Columns:")
-        print(", ".join(cols_display))
-        if not df.empty:
-            first_row = df.head(1).copy()
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(current);")
+        cols_info = cur.fetchall()
+        cols = [row[1] for row in cols_info]
+        cols_display = (
+            cols if state["is_header"] else [f"${i + 1}" for i in range(len(cols))]
+        )
+        print("Columns:\n" + ", ".join(cols_display))
+        if not state["df_empty"]:
+            df = pd.read_sql_query("SELECT * FROM current LIMIT 1", conn)
             if not state["is_header"]:
-                first_row.columns = cols_display
+                df.columns = cols_display
             print("\nFirst row preview:")
-            print(tabulate(first_row, headers="keys", tablefmt="grid", showindex=False))
+            print(tabulate(df, headers="keys", tablefmt="grid", showindex=False))
     elif cmd_lower.startswith("head"):
-        parts = cmd.split()
         n = 5
+        parts = cmd.split()
         if len(parts) >= 2 and parts[1].isdigit():
             n = int(parts[1])
-        print_result(df.head(n), is_header=state["is_header"])
+        df = pd.read_sql_query(f"SELECT * FROM current LIMIT {n}", conn)
+        print_result(df, is_header=state["is_header"])
     elif cmd_lower.startswith("tail"):
-        parts = cmd.split()
         n = 5
+        parts = cmd.split()
         if len(parts) >= 2 and parts[1].isdigit():
             n = int(parts[1])
-        print_result(df.tail(n), is_header=state["is_header"])
+        total = pd.read_sql_query("SELECT COUNT(*) AS c FROM current", conn)["c"][0]
+        offset = max(total - n, 0)
+        df = pd.read_sql_query(f"SELECT * FROM current LIMIT {n} OFFSET {offset}", conn)
+        print_result(df, is_header=state["is_header"])
     elif cmd_lower.startswith("sep"):
-        parts = cmd.split(maxsplit=1)
-        if len(parts) == 2:
-            sep = parts[1].encode("utf-8").decode("unicode_escape")
-            state["sep"] = sep
-            df_new, is_header = read_log(
-                state["file"], has_header=state["is_header"], sep=sep
-            )
-            state["df"] = df_new
-            state["is_header"] = is_header
-            print(f"Separator changed to: {repr(sep)}")
-        else:
-            print(f"Current separator: {repr(state['sep'])}")
+        print(f"Current separator: {repr(state['sep'])}")
     elif cmd_lower == "clear":
         clear_screen()
     else:
-        print(f"Unknown command: {line}")
+        df = execute_sql(conn, line)
+        print_result(df, is_header=state["is_header"])
 
 
-def sql_cli(df, file_path, sep, is_header):
-    state = {"df": df, "file": file_path, "sep": sep, "is_header": is_header}
+def sql_cli(state):
     print("SQLite3-like SQL CLI for table 'current'")
     print("Type SQL statements terminated with ';'")
     print(
@@ -206,17 +180,14 @@ def sql_cli(df, file_path, sep, is_header):
         if not line.strip():
             continue
         if line.startswith("."):
-            handle_command(line, state["df"], state)
+            handle_command(line, state)
             continue
         buffer += (" " if buffer else "") + line
         if ";" in buffer:
             query = buffer
             buffer = ""
-            result = execute_sql(state["df"], query)
-            print_result(result, is_header=state["is_header"])
-
-
-# ------------------------ 主程序 ------------------------
+            df = execute_sql(state["conn"], query)
+            print_result(df, is_header=state["is_header"])
 
 
 def main():
@@ -227,7 +198,6 @@ def main():
     if not os.path.exists(file_path):
         print(f"File doesn't exist: {file_path}")
         return
-
     sep = None
     if "--sep" in sys.argv:
         idx = sys.argv.index("--sep")
@@ -237,20 +207,29 @@ def main():
     ext = os.path.splitext(file_path)[1].lower()
     force_no_header = ext != ".csv"
 
+    chunksize = 100_000
     if force_no_header:
-        df, is_header = read_log(
-            file_path, has_header=False, sep=sep if sep else r"\s+"
+        df_iter, is_header = read_log(
+            file_path, has_header=False, sep=sep if sep else r"\s+", chunksize=chunksize
         )
     else:
-        df, is_header = read_log(file_path, has_header=True, sep=sep)
+        df_iter, is_header = read_log(
+            file_path, has_header=True, sep=sep, chunksize=chunksize
+        )
         if not is_header:
-            df, is_header = read_log(
-                file_path, has_header=False, sep=sep if sep else r"\s+"
+            df_iter, is_header = read_log(
+                file_path,
+                has_header=False,
+                sep=sep if sep else r"\s+",
+                chunksize=chunksize,
             )
 
-    sql_cli(
-        df, file_path, sep if sep else (r"\s+" if force_no_header else ","), is_header
-    )
+    conn = sqlite3.connect(":memory:")
+    load_dataframe_to_sqlite(conn, df_iter, is_header=is_header)
+
+    state = {"conn": conn, "is_header": is_header, "sep": sep, "df_empty": False}
+
+    sql_cli(state)
 
 
 if __name__ == "__main__":
