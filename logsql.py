@@ -5,15 +5,18 @@ SQLite3-like SQL CLI for CSV/text logs
 - 表名固定为 current
 - 支持标准 SQL: select ... from current where ... group by ... order by ... limit ...
 - 有表头 CSV → 显示真实列名
-- 无表头文本 → 显示 $1, $2 …，内部仍用 _N 列名
+- 非 CSV 文件 / 无表头文本 → 显示 $1, $2 …，内部仍用 _N 列名
 - 可通过 --sep 或 .sep 动态设置分隔符（例如 ',', '\t', ' '）
 - 打印漂亮表格，长内容自动换行，去除前后空白
 - 交互式 CLI 类似 SQLite3/MySQL
-
 Behavior change: Files whose extension is NOT ".csv" are treated as no-header by default.
 """
 
-import sys, os, re, shutil, platform
+import sys
+import os
+import re
+import shutil
+import platform
 import pandas as pd
 from tabulate import tabulate
 from pandasql import sqldf
@@ -61,14 +64,21 @@ def read_log(file_path, has_header=True, sep=None):
                 raise ValueError("No header detected")
             is_header = True
         else:
-            df = pd.read_csv(file_path, sep=sep, header=None, on_bad_lines="skip")
+            df = pd.read_csv(
+                file_path, sep=sep, header=None, engine="python", on_bad_lines="skip"
+            )
+            df = df.copy()
             df.columns = [f"_{i + 1}" for i in range(len(df.columns))]
             is_header = False
     except Exception:
         # 任何读取异常都退到无表头解析
-        df = pd.read_csv(file_path, sep=sep, header=None, on_bad_lines="skip")
+        df = pd.read_csv(
+            file_path, sep=sep, header=None, engine="python", on_bad_lines="skip"
+        )
+        df = df.copy()
         df.columns = [f"_{i + 1}" for i in range(len(df.columns))]
         is_header = False
+
     df = df.apply(lambda col: clean_string_column(col) if col.dtype == object else col)
     return df, is_header
 
@@ -164,12 +174,12 @@ def handle_command(line, df, state):
         if len(parts) == 2:
             sep = parts[1].encode("utf-8").decode("unicode_escape")
             state["sep"] = sep
-            print(f"Separator changed to: {repr(sep)}")
             df_new, is_header = read_log(
                 state["file"], has_header=state["is_header"], sep=sep
             )
             state["df"] = df_new
             state["is_header"] = is_header
+            print(f"Separator changed to: {repr(sep)}")
         else:
             print(f"Current separator: {repr(state['sep'])}")
     elif cmd_lower == "clear":
@@ -224,17 +234,14 @@ def main():
         if idx + 1 < len(sys.argv):
             sep = sys.argv[idx + 1].encode("utf-8").decode("unicode_escape")
 
-    # If file extension is not .csv -> force no-header mode (treat as log)
     ext = os.path.splitext(file_path)[1].lower()
     force_no_header = ext != ".csv"
 
     if force_no_header:
-        # default sep for no-header files is whitespace
         df, is_header = read_log(
             file_path, has_header=False, sep=sep if sep else r"\s+"
         )
     else:
-        # CSV path: try reading as CSV with header, fallback to no-header if needed
         df, is_header = read_log(file_path, has_header=True, sep=sep)
         if not is_header:
             df, is_header = read_log(
