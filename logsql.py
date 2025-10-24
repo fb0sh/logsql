@@ -8,6 +8,8 @@ import sqlite3
 import pandas as pd
 from tabulate import tabulate
 
+# ------------------------ 工具函数 ------------------------
+
 
 def clear_screen():
     os.system("cls" if platform.system() == "Windows" else "clear")
@@ -34,40 +36,86 @@ def wrap_dataframe(df, max_width=None):
     return df_wrapped
 
 
+# ------------------------ 文件读取 ------------------------
+
+
 def read_log(file_path, has_header=True, sep=None, chunksize=None):
-    if sep is None:
-        sep = r"\s+" if not has_header else ","
+    ext = os.path.splitext(file_path)[1].lower()
     try:
-        df_iter = pd.read_csv(
-            file_path,
-            sep=sep,
-            engine="python",
-            quotechar='"',
-            on_bad_lines="skip",
-            header=0 if has_header else None,
-            chunksize=chunksize,
-        )
-        return df_iter, has_header
+        if ext in [".xls", ".xlsx"]:
+            df = pd.read_excel(file_path, header=0 if has_header else None)
+            if not has_header:
+                df.columns = [f"_{i + 1}" for i in range(len(df.columns))]
+            return df, has_header
+        else:
+            if sep is None:
+                sep = r"\s+" if not has_header else ","
+
+            # 定义一个生成器，保证每个 chunk 列名一致
+            def csv_chunk_generator():
+                first_chunk = True
+                for chunk in pd.read_csv(
+                    file_path,
+                    sep=sep,
+                    engine="python",
+                    quotechar='"',
+                    on_bad_lines="skip",
+                    header=0 if has_header else None,
+                    chunksize=chunksize,
+                ):
+                    if not has_header:
+                        if first_chunk:
+                            colnames = [f"_{i + 1}" for i in range(len(chunk.columns))]
+                            first_chunk = False
+                        chunk.columns = colnames
+                    yield chunk
+
+            return csv_chunk_generator(), has_header
     except Exception:
-        df_iter = pd.read_csv(
-            file_path,
-            sep=sep,
-            engine="python",
-            header=None,
-            on_bad_lines="skip",
-            chunksize=chunksize,
-        )
-        return df_iter, False
+        # 异常处理，保持兼容性
+        if ext in [".xls", ".xlsx"]:
+            df = pd.read_excel(file_path, header=None)
+            df.columns = [f"_{i + 1}" for i in range(len(df.columns))]
+            return df, False
+        else:
+
+            def fallback_generator():
+                first_chunk = True
+                for chunk in pd.read_csv(
+                    file_path,
+                    sep=sep if sep else r"\s+",
+                    header=None,
+                    on_bad_lines="skip",
+                    chunksize=chunksize,
+                ):
+                    if first_chunk:
+                        colnames = [f"_{i + 1}" for i in range(len(chunk.columns))]
+                        first_chunk = False
+                    chunk.columns = colnames
+                    yield chunk
+
+            return fallback_generator(), False
 
 
-def load_dataframe_to_sqlite(conn, df_iter, table_name="current", is_header=True):
+# ------------------------ SQLite 加载 ------------------------
+
+
+def load_dataframe_to_sqlite(conn, df_iter, table_name="current"):
     cur = conn.cursor()
     cur.execute(f"DROP TABLE IF EXISTS {table_name}")
-    for chunk in df_iter:
-        # 无表头给列名
-        if not is_header:
-            chunk.columns = [f"_{i + 1}" for i in range(len(chunk.columns))]
-        chunk.to_sql(table_name, conn, if_exists="append", index=False)
+
+    if isinstance(df_iter, pd.DataFrame):
+        df_iter.to_sql(table_name, conn, if_exists="append", index=False)
+    elif hasattr(df_iter, "__iter__"):
+        for chunk in df_iter:
+            if chunk.columns.str.contains("Unnamed").any():
+                chunk.columns = [f"_{i + 1}" for i in range(len(chunk.columns))]
+            chunk.to_sql(table_name, conn, if_exists="append", index=False)
+    else:
+        raise TypeError(f"Unsupported object type: {type(df_iter)}")
+
+
+# ------------------------ SQL 执行 ------------------------
 
 
 def execute_sql(conn, query):
@@ -81,6 +129,9 @@ def execute_sql(conn, query):
     except Exception as e:
         print(f"SQL 执行出错，请检查语法或列名: {e}")
         return None
+
+
+# ------------------------ 输出 ------------------------
 
 
 def print_result(df, is_header=True):
@@ -97,6 +148,30 @@ def print_result(df, is_header=True):
     print(f"({len(df_display)} row{'s' if len(df_display) != 1 else ''})")
 
 
+# ------------------------ 导出功能 ------------------------
+
+
+def export_dataframe(df, filename):
+    if df is None or df.empty:
+        print("No data to export.")
+        return
+    _, ext = os.path.splitext(filename)
+    try:
+        if ext.lower() == ".csv":
+            df.to_csv(filename, index=False, encoding="utf-8-sig")
+        elif ext.lower() in [".xls", ".xlsx"]:
+            df.to_excel(filename, index=False)
+        else:
+            print("Unsupported export format. Use .csv or .xlsx")
+            return
+        print(f"Saved {len(df)} rows to {filename}")
+    except Exception as e:
+        print(f"Export failed: {e}")
+
+
+# ------------------------ CLI ------------------------
+
+
 def print_help():
     print("Examples:")
     print("  SELECT * FROM current LIMIT 10;")
@@ -109,6 +184,7 @@ def print_help():
     print("  .head [N]       Show first N rows")
     print("  .tail [N]       Show last N rows")
     print("  .sep <char>     Change separator")
+    print("  .export <file>  Export last query result (.csv/.xlsx)")
     print("  .clear          Clear screen")
     print("  .help           Show help")
     print("  .q              Quit")
@@ -118,6 +194,8 @@ def handle_command(line, state):
     cmd = line[1:].strip()
     cmd_lower = cmd.lower()
     conn = state["conn"]
+    last_df = state.get("last_df", None)
+
     if cmd_lower in ("q", "quit"):
         print("Exit.")
         sys.exit(0)
@@ -132,7 +210,9 @@ def handle_command(line, state):
             cols if state["is_header"] else [f"${i + 1}" for i in range(len(cols))]
         )
         print("Columns:\n" + ", ".join(cols_display))
-        if not state["df_empty"]:
+
+        # 仅非 Excel/CSV 文件打印第一行预览
+        if not state.get("is_excel", False) and not state["df_empty"]:
             df = pd.read_sql_query("SELECT * FROM current LIMIT 1", conn)
             if not state["is_header"]:
                 df.columns = cols_display
@@ -145,6 +225,7 @@ def handle_command(line, state):
             n = int(parts[1])
         df = pd.read_sql_query(f"SELECT * FROM current LIMIT {n}", conn)
         print_result(df, is_header=state["is_header"])
+        state["last_df"] = df
     elif cmd_lower.startswith("tail"):
         n = 5
         parts = cmd.split()
@@ -154,20 +235,46 @@ def handle_command(line, state):
         offset = max(total - n, 0)
         df = pd.read_sql_query(f"SELECT * FROM current LIMIT {n} OFFSET {offset}", conn)
         print_result(df, is_header=state["is_header"])
+        state["last_df"] = df
     elif cmd_lower.startswith("sep"):
-        print(f"Current separator: {repr(state['sep'])}")
+        parts = cmd.split(maxsplit=1)
+        if len(parts) == 2:
+            new_sep = parts[1].encode("utf-8").decode("unicode_escape")
+            state["sep"] = new_sep
+            # 仅对非 Excel 文件重新加载数据
+            if not state.get("is_excel", False):
+                print(f"Changing separator to: {repr(new_sep)} and reloading table...")
+                conn = state["conn"]
+                conn.execute("DROP TABLE IF EXISTS current")
+                df_iter, is_header = read_log(
+                    state["file_path"],
+                    has_header=state["is_header"],
+                    sep=new_sep,
+                    chunksize=state.get("chunksize", None),
+                )
+                load_dataframe_to_sqlite(conn, df_iter)
+                print("Table reloaded.")
+        else:
+            print(f"Current separator: {repr(state['sep'])}")
+    elif cmd_lower.startswith("export"):
+        parts = cmd.split(maxsplit=1)
+        if len(parts) == 2:
+            export_dataframe(last_df, parts[1])
+        else:
+            print("Usage: .export <filename>")
     elif cmd_lower == "clear":
         clear_screen()
     else:
         df = execute_sql(conn, line)
         print_result(df, is_header=state["is_header"])
+        state["last_df"] = df
 
 
 def sql_cli(state):
     print("SQLite3-like SQL CLI for table 'current'")
     print("Type SQL statements terminated with ';'")
     print(
-        "Built-in commands: .help, .cols, .head [N], .tail [N], .sep <char>, .clear, .q to quit"
+        "Built-in commands: .help, .cols, .head [N], .tail [N], .sep <char>, .export <file>, .clear, .q to quit"
     )
     buffer = ""
     while True:
@@ -188,6 +295,10 @@ def sql_cli(state):
             buffer = ""
             df = execute_sql(state["conn"], query)
             print_result(df, is_header=state["is_header"])
+            state["last_df"] = df
+
+
+# ------------------------ 主程序 ------------------------
 
 
 def main():
@@ -205,7 +316,7 @@ def main():
             sep = sys.argv[idx + 1].encode("utf-8").decode("unicode_escape")
 
     ext = os.path.splitext(file_path)[1].lower()
-    force_no_header = ext != ".csv"
+    force_no_header = ext not in [".csv", ".xls", ".xlsx"]
 
     chunksize = 100_000
     if force_no_header:
@@ -225,9 +336,18 @@ def main():
             )
 
     conn = sqlite3.connect(":memory:")
-    load_dataframe_to_sqlite(conn, df_iter, is_header=is_header)
+    load_dataframe_to_sqlite(conn, df_iter)
 
-    state = {"conn": conn, "is_header": is_header, "sep": sep, "df_empty": False}
+    state = {
+        "conn": conn,
+        "is_header": is_header,
+        "sep": sep,
+        "df_empty": False,
+        "last_df": None,
+        "file_path": file_path,
+        "is_excel": ext in [".xls", ".xlsx"],
+        "chunksize": chunksize,
+    }
 
     sql_cli(state)
 
